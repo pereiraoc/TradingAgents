@@ -29,6 +29,7 @@ def _decode(row: dict | None) -> dict | None:
     if row:
         row["replay"] = json.loads(row.pop("replay_json") or "null")
         row["weights"] = json.loads(row.pop("weights_json") or "{}")
+        row["auto"] = json.loads(row.pop("auto_json", None) or "null")
     return row
 
 
@@ -77,7 +78,7 @@ def context(store: Store, pid: int) -> PortfolioContext:
 
 def record_decision(store: Store, pid: int, job_id: int, ticker: str, trade_date: str,
                     rating: str, trader_plan: str | None) -> int | None:
-    if rating == "REVIEW":
+    if rating == "REVIEW" or get(store, pid) is None:   # the portfolio may be deleted mid-analysis
         return None
     existing = store.one("select id from trades where job_id=?", (job_id,))
     if existing:  # a re-run of the same job must not trade twice
@@ -144,4 +145,6 @@ def snapshot(store: Store, pid: int, prices: PriceSource, today: str) -> dict:
         "curve": curve,
         "benchmark_curve": [{"date": d, "value": p["initial_cash"] * c / base} for d, c in bench] if base else [],
         "trades": store.all("select * from trades where portfolio_id=? order by trade_date desc, id desc", (pid,)),
+        "jobs": store.all("select id, ticker, trade_date, status, rating, error, payload_json, created_at, finished_at"
+                          " from jobs where portfolio_id=? order by id desc limit 200", (pid,)),
     }

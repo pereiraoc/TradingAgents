@@ -12,7 +12,7 @@ from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.reporting import write_report_tree
 
-from . import book, jobs, radar
+from . import autopilot, book, jobs, radar
 from .fills import PriceSource
 from .llm import KeyVault, build_config, provider_key, scrub
 from .runner import run_analysis
@@ -21,6 +21,7 @@ from .store import Store
 logger = logging.getLogger(__name__)
 FILL_EVERY_S = 3600
 COLLECT_EVERY_S = 3600
+AUTO_EVERY_S = 60
 MODEL_POLL_S = 15
 MODEL_WAIT_MAX_S = 2 * 3600
 
@@ -55,7 +56,7 @@ def _default_graph(config: dict, analysts: list[str]):
 class Worker:
     def __init__(self, store: Store, data_dir: Path, *, prices: PriceSource, keys: KeyVault,
                  graph_factory=None, backtest_fn=None, base_config: dict | None = None, model_up=None,
-                 ask_factory=None, collect_fn=None):
+                 ask_factory=None, collect_fn=None, clock=None):
         self.store, self.data_dir, self.prices, self.keys = store, Path(data_dir), prices, keys
         self.graph_factory = graph_factory or _default_graph
         self.backtest_fn = backtest_fn or run_backtest
@@ -70,7 +71,8 @@ class Worker:
         self.waiting: int | None = None
         self._wait_since: dict[int, float] = {}
         self._last_probe: dict[int, float] = {}
-        self._last_fill = self._last_collect = -float("inf")
+        self._last_fill = self._last_collect = self._last_auto = -float("inf")
+        self.clock = clock or autopilot.now_local
 
     def recover(self) -> None:
         jobs.recover(self.store, self.keys.has)
@@ -184,7 +186,7 @@ class Worker:
     def _loop(self) -> None:
         while not self._stop.is_set():
             worked = False
-            for step in (self.run_once, self._hourly_fill, self._hourly_collect):
+            for step in (self.run_once, self._hourly_fill, self._hourly_collect, self._auto_rounds):
                 try:
                     worked = step() or worked
                 except Exception:  # never let the loop die, nor one chore starve the others
@@ -203,6 +205,22 @@ class Worker:
             self._last_collect = time.monotonic()
             self.collect_fn(self.store)
         return False
+
+    def _auto_rounds(self) -> bool:
+        """Automatic portfolios whose round is due start it, but only while their model is serving."""
+        if time.monotonic() - self._last_auto < AUTO_EVERY_S:
+            return False
+        self._last_auto = time.monotonic()
+        at, queued = self.clock(), False
+        for p in book.listing(self.store):
+            auto = p["auto"] and autopilot.get(self.store, p["id"])
+            if p["mode"] != "live" or not autopilot.due(auto, at) or not self.model_up(auto["model"], None):
+                continue
+            try:
+                queued = bool(autopilot.run_round(self.store, p["id"], self.prices.currency, at)) or queued
+            except Exception:  # one portfolio's round must not stop the others
+                logger.exception("automatic round of portfolio %s failed", p["id"])
+        return queued
 
     def start(self) -> None:
         self.recover()

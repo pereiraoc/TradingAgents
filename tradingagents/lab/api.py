@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from tradingagents import __version__
 
-from . import book, jobs, radar, replay
+from . import autopilot, book, jobs, radar, replay
 from .fills import PriceSource
 from .llm import KeyVault, parse_model
 from .store import Store
@@ -48,6 +48,18 @@ class ReplayIn(BaseModel):
     api_key: str | None = None
 
 
+class AutoIn(BaseModel):
+    enabled: bool | None = None
+    tickers: list[str] | None = None
+    radar_top: int | None = Field(None, ge=0, le=10)
+    max_positions: int | None = Field(None, ge=1, le=30)
+    hour: int | None = Field(None, ge=0, le=23)
+    analysts: list[str] | None = None
+    model: dict | None = None
+    api_key: str | None = None
+    run_now: bool = False
+
+
 class PortfolioIn(BaseModel):
     name: str
     currency: str
@@ -56,6 +68,7 @@ class PortfolioIn(BaseModel):
     weights: dict | None = None
     mode: str = "live"
     replay: ReplayIn | None = None
+    auto: AutoIn | None = None
 
 
 class RunIn(BaseModel):
@@ -217,8 +230,17 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
                 cur = prices.currency(t)
                 if cur and cur.upper() != body.currency.upper():
                     raise HTTPException(400, f"{t} é cotado em {cur}; a carteira é em {body.currency.upper()}")
+        auto = None
+        if body.auto:
+            if body.mode != "live":
+                raise HTTPException(400, "só carteira ao vivo pode ser automática")
+            auto = auto_patch(body.auto, body.currency.upper())
+            if not auto.get("model"):
+                raise HTTPException(400, "escolha o modelo da carteira automática")
         pid = book.create(store, body.name, body.currency, body.initial_cash, body.benchmark, body.mode,
                           r.model_dump(exclude={"api_key"}) if r else None, body.weights)
+        if auto:
+            autopilot.save(store, pid, auto)
         if r:
             ids = replay.schedule(store, pid, tickers, r.start, r.end, r.every_days, r.analysts, model)
             for jid in ids:
@@ -229,7 +251,53 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
     def portfolio(pid: int):
         p = book.get(store, pid) or _404()
         today = (p["replay"] or {}).get("end") if p["mode"] == "replay" else None
-        return book.snapshot(store, pid, prices, today or _date.today().isoformat())
+        snap = book.snapshot(store, pid, prices, today or _date.today().isoformat())
+        if p["auto"]:
+            auto = autopilot.get(store, pid)
+            snap["auto"] = {**auto, "next": autopilot.next_slot(autopilot.now_local(), auto["hour"])
+                            if auto["last_round"] else "agora", "model_up": worker.model_up(auto["model"], None)
+                            if auto["enabled"] and auto["model"] else None}
+        return snap
+
+    def auto_patch(body: AutoIn, currency: str) -> dict:
+        """Checked before anything is saved; the API key is refused, never kept."""
+        if body.api_key:
+            raise HTTPException(400, "carteira automática só com modelo local: a chave de API não fica guardada")
+        patch = body.model_dump(exclude={"api_key", "run_now"}, exclude_none=True)
+        if "model" in patch:
+            patch["model"] = _model(patch["model"], None)
+        if "tickers" in patch:
+            patch["tickers"] = list(dict.fromkeys(normalize(t) for t in patch["tickers"] if t.strip()))
+            for t in patch["tickers"]:
+                cur = prices.currency(t)
+                if cur and cur.upper() != currency:
+                    raise HTTPException(400, f"{t} é cotado em {cur}; a carteira é em {currency}")
+        if body.run_now:
+            patch["last_round"] = None
+        return patch
+
+    @app.post("/portfolios/{pid}/auto")
+    def set_auto(pid: int, body: AutoIn):
+        p = book.get(store, pid) or _404()
+        if p["mode"] != "live":
+            raise HTTPException(400, "só carteira ao vivo pode ser automática")
+        auto = autopilot.save(store, pid, auto_patch(body, p["currency"]))
+        if auto["enabled"] and not auto["model"]:
+            raise HTTPException(400, "escolha o modelo da carteira automática")
+        return {"auto": auto}
+
+    @app.delete("/portfolios/{pid}")
+    def delete_portfolio(pid: int):
+        book.get(store, pid) or _404()
+        for j in store.all("select id from jobs where portfolio_id=? and status='queued'", (pid,)):
+            keys.drop(j["id"])
+        store.run("delete from jobs where portfolio_id=? and status='queued'", (pid,))
+        store.run("update jobs set portfolio_id=null where portfolio_id=?", (pid,))   # reports stay
+        store.run("delete from trades where portfolio_id=?", (pid,))
+        store.run("delete from portfolios where id=?", (pid,))
+        if radar.get_config(store).get("portfolio_id") == pid:
+            radar.set_config(store, {"portfolio_id": None})
+        return {"ok": True}
 
     @app.post("/portfolios/{pid}/run")
     def run_portfolio(pid: int, body: RunIn):

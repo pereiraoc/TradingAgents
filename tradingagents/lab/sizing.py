@@ -67,7 +67,8 @@ def decide_target(rating: str, trader_plan: str | None, weights: dict | None = N
     weights = {**DEFAULT_WEIGHTS, **(weights or {})}
     action = trader_action(trader_plan)
     agrees = action is None or (rating in BULLISH and action == "Buy") or (rating in BEARISH and action == "Sell")
-    sizing = trader_sizing(trader_plan) if agrees else None
+    # an automatic portfolio spreads its cash itself: the trader's percent would leave most of it idle
+    sizing = trader_sizing(trader_plan) if agrees and weights.get("ai_sizing", True) else None
     return (sizing and _parse(sizing, rating in BEARISH)) or Target("weight", weights[rating], "default_weight")
 
 

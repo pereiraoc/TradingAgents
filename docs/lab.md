@@ -35,6 +35,28 @@ No desktop do pereiraoc ele roda como o container `tradingagents-lab` do compose
 - Nota de alta nunca reduz posição; de baixa nunca aumenta; sem venda a descoberto; quantidade
   inteira limitada pelo caixa.
 
+## Carteira automática
+
+Uma carteira ao vivo pode analisar e operar sozinha (`auto`):
+
+- **Universo**: o que ela tem em carteira + a lista base (`tickers`) + as `radar_top` ações de alta
+  mais fortes do Radar na moeda dela (sem repetir dentro do `cooldown_days` do Radar).
+- **Rodadas**: a primeira assim que o modelo responde; depois uma por dia útil depois de `hour`
+  (horário de Brasília). Cada ação vira uma análise com data de hoje; a operação sai no fechamento
+  seguinte, como qualquer outra. Ação já na fila, rodando ou analisada hoje não entra de novo.
+- **Tamanho**: os pesos viram `1/max_positions` para Buy (Overweight 70%, Underweight 30% disso)
+  e o percentual do trader é ignorado (`weights.ai_sizing = false`) — senão quase todo o caixa
+  ficaria parado.
+- **Modelo**: só começa uma rodada se o modelo já estiver respondendo; nada aqui liga a GPU.
+  Só modelo sem chave (local): a chave de API nunca é guardada, então é recusada.
+
+```
+POST /portfolios/{id}/auto  {enabled?, tickers?, radar_top?, max_positions?, hour?, analysts?, model?, run_now?}
+DELETE /portfolios/{id}     apaga carteira e operações; relatórios ficam
+```
+
+`GET /portfolios/{id}` traz também `jobs` (análises da carteira) e `auto` (com `next` e `model_up`).
+
 ## Chaves de API
 
 Chegam no corpo do pedido (`api_key`) e ficam **só em memória** até o job terminar. Se o
@@ -52,7 +74,7 @@ POST /jobs/{id}/retry       {api_key?}
 POST /jobs/{id}/resolve     {rating | null}
 DELETE /jobs/{id}           só na fila
 GET  /reports/{id}          HTML    · GET /reports/{id}/md  Markdown
-GET  /portfolios            · POST /portfolios {name, currency, initial_cash, benchmark?, weights?,
+GET  /portfolios            · POST /portfolios {name, currency, initial_cash, benchmark?, weights?, auto?,
                               mode: live|replay, replay?: {tickers, start, end, every_days, analysts?, model, api_key?}}
 GET  /portfolios/{id}       posições, caixa, valor, curva x índice, extrato
 POST /portfolios/{id}/run   {tickers | watchlist_id, analysts?, model, api_key?, date?}

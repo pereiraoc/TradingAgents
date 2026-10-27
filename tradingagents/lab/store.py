@@ -18,7 +18,7 @@ create table if not exists job_events(
 create table if not exists portfolios(
   id integer primary key, name text not null, currency text not null, initial_cash real not null,
   benchmark text not null, mode text not null default 'live', replay_json text, weights_json text,
-  created_at text not null);
+  created_at text not null, auto_json text);
 create table if not exists trades(
   id integer primary key, portfolio_id integer not null, job_id integer, ticker text not null,
   trade_date text not null, rating text not null, trader_plan text, side text, quantity real,
@@ -51,6 +51,9 @@ class Store:
         with self._lock:
             self._con.execute("pragma journal_mode=wal")
             self._con.executescript(SCHEMA)
+            cols = {r[1] for r in self._con.execute("pragma table_info(portfolios)")}
+            if "auto_json" not in cols:   # lab.sqlite from before automatic portfolios
+                self._con.execute("alter table portfolios add column auto_json text")
 
     def run(self, sql: str, args=()) -> int:
         with self._lock:
