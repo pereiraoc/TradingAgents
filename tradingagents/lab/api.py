@@ -12,10 +12,11 @@ from pydantic import BaseModel
 
 from tradingagents import __version__
 
-from . import book, jobs, replay
+from . import book, jobs, radar, replay
 from .fills import PriceSource
 from .llm import KeyVault, parse_model
 from .store import Store
+from .symbols import normalize
 
 
 class JobIn(BaseModel):
@@ -69,6 +70,12 @@ class WatchlistIn(BaseModel):
     tickers: list[str]
 
 
+class RadarRunIn(BaseModel):
+    model: dict
+    api_key: str | None = None
+    analysts: list[str] = []
+
+
 class BacktestIn(BaseModel):
     tickers: list[str]
     start: str
@@ -100,7 +107,7 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
             raise HTTPException(400, f"{ticker} é cotado em {cur}; a carteira é em {p['currency']}")
 
     def add_job(ticker: str, day: str, analysts, model: dict, api_key, pid=None) -> int:
-        ticker = ticker.strip().upper()
+        ticker = normalize(ticker)
         check_currency(pid, ticker)
         jid = jobs.enqueue(store, "analysis", ticker=ticker, trade_date=day, analysts=analysts,
                            model=model, portfolio_id=pid)
@@ -110,6 +117,7 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
     @app.get("/health")
     def health():
         return {"ok": True, "version": __version__, "running": worker.current,
+                "waiting_model": getattr(worker, "waiting", None),
                 "queued": len(jobs.listing(store, "queued", 10_000))}
 
     @app.post("/jobs")
@@ -183,9 +191,10 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
         pid = book.create(store, body.name, body.currency, body.initial_cash, body.benchmark, body.mode,
                           r.model_dump(exclude={"api_key"}) if r else None, body.weights)
         if r:
-            for t in r.tickers:
-                check_currency(pid, t.upper())
-            ids = replay.schedule(store, pid, [t.upper() for t in r.tickers], r.start, r.end, r.every_days,
+            tickers = [normalize(t) for t in r.tickers]
+            for t in tickers:
+                check_currency(pid, t)
+            ids = replay.schedule(store, pid, tickers, r.start, r.end, r.every_days,
                                   r.analysts, _model(r.model, r.api_key))
             for jid in ids:
                 keys.put(jid, r.api_key)
@@ -214,7 +223,7 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
 
     @app.post("/watchlists")
     def add_watchlist(body: WatchlistIn):
-        tickers = [t.strip().upper() for t in body.tickers if t.strip()]
+        tickers = [normalize(t) for t in body.tickers if t.strip()]
         return {"id": store.run("insert or replace into watchlists(name, tickers_json) values (?,?)",
                                 (body.name, json.dumps(tickers)))}
 
@@ -230,7 +239,7 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
 
     @app.post("/backtests")
     def add_backtest(body: BacktestIn):
-        tickers = [t.strip().upper() for t in body.tickers]
+        tickers = [normalize(t) for t in body.tickers]
         jid = jobs.enqueue(store, "backtest", analysts=body.analysts, model=_model(body.model, body.api_key))
         keys.put(jid, body.api_key)
         bid = store.run("insert into backtests(job_id, tickers_json, start, end, every_days) values (?,?,?,?,?)",
@@ -242,6 +251,44 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
         row = store.one("select b.*, j.status from backtests b left join jobs j on j.id=b.job_id where b.id=?",
                         (bid,)) or _404()
         return _bt(row)
+
+    @app.get("/search")
+    def search(q: str):
+        from tradingagents.dataflows.vendors.yahoo.market import search_symbols
+
+        q = q.strip()
+        if len(q) < 2:
+            return {"results": []}
+        results = search_symbols(q)
+        guess = normalize(q)
+        if guess != q.upper() and not any(r["symbol"] == guess for r in results):
+            results.insert(0, {"symbol": guess, "name": "código da B3", "exchange": "São Paulo", "type": "EQUITY"})
+        return {"results": results}
+
+    @app.get("/radar")
+    def radar_view(days: int = 7):
+        signals = store.all("select * from radar_signals order by ts desc limit 80")
+        for sig in signals:
+            sig["hits"] = store.all("select ticker, direction, strength, reason from radar_hits where signal_id=?",
+                                    (sig["id"],))
+        pending = store.one("select count(*) n from radar_signals where processed=0")["n"]
+        return {"ranking": radar.ranking(store, days=days), "signals": signals, "pending": pending,
+                "config": radar.get_config(store)}
+
+    @app.post("/radar/config")
+    def radar_config(patch: dict):
+        allowed = {k: v for k, v in patch.items() if k in radar.DEFAULT_CONFIG}
+        return radar.set_config(store, allowed)
+
+    @app.post("/radar/collect")
+    def radar_collect():
+        return {"report": radar.collect(store)}
+
+    @app.post("/radar/run")
+    def radar_run(body: RadarRunIn):
+        jid = jobs.enqueue(store, "radar", analysts=body.analysts, model=_model(body.model, body.api_key))
+        keys.put(jid, body.api_key)
+        return {"id": jid}
 
     return app
 

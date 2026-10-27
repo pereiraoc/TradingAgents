@@ -25,6 +25,13 @@ create table if not exists trades(
   price real, fill_date text, sizing_source text, status text not null default 'pending', reason text);
 create table if not exists watchlists(
   id integer primary key, name text not null unique, tickers_json text not null);
+create table if not exists radar_signals(
+  id integer primary key, source text not null, uid text not null unique, ts text not null, actor text,
+  title text, url text, body text, processed integer not null default 0, created_at text not null);
+create table if not exists radar_hits(
+  id integer primary key, signal_id integer not null, ticker text not null, direction integer not null,
+  strength real not null, reason text);
+create table if not exists radar_config(id integer primary key check (id = 1), json text not null);
 create table if not exists backtests(
   id integer primary key, job_id integer, tickers_json text not null, start text not null,
   end text not null, every_days integer not null, summary_json text);

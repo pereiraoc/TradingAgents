@@ -12,7 +12,7 @@ from tradingagents.backtest import iter_grid, run_backtest, summarize
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.reporting import write_report_tree
 
-from . import book, jobs
+from . import book, jobs, radar
 from .fills import PriceSource
 from .llm import KeyVault, build_config, provider_key
 from .runner import run_analysis
@@ -20,6 +20,7 @@ from .store import Store
 
 logger = logging.getLogger(__name__)
 FILL_EVERY_S = 3600
+COLLECT_EVERY_S = 3600
 MODEL_POLL_S = 15
 MODEL_WAIT_MAX_S = 2 * 3600
 
@@ -38,6 +39,13 @@ def _default_model_up(model: dict, key: str | None) -> bool:
         return False
 
 
+def _default_ask(config: dict):
+    from tradingagents.llm_clients.factory import create_tier_client
+
+    llm = create_tier_client(config, "quick").get_llm()
+    return lambda prompt: llm.invoke(prompt).content
+
+
 def _default_graph(config: dict, analysts: list[str]):
     from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -46,7 +54,8 @@ def _default_graph(config: dict, analysts: list[str]):
 
 class Worker:
     def __init__(self, store: Store, data_dir: Path, *, prices: PriceSource, keys: KeyVault,
-                 graph_factory=None, backtest_fn=None, base_config: dict | None = None, model_up=None):
+                 graph_factory=None, backtest_fn=None, base_config: dict | None = None, model_up=None,
+                 ask_factory=None, collect_fn=None):
         self.store, self.data_dir, self.prices, self.keys = store, Path(data_dir), prices, keys
         self.graph_factory = graph_factory or _default_graph
         self.backtest_fn = backtest_fn or run_backtest
@@ -55,6 +64,9 @@ class Worker:
         self._thread: threading.Thread | None = None
         self.current: int | None = None
         self.model_up = model_up or _default_model_up
+        self.ask_factory = ask_factory or _default_ask
+        self.collect_fn = collect_fn or radar.collect
+        self._symbols: dict[str, bool] = {}
         self.waiting: int | None = None
         self._wait_since: dict[int, float] = {}
         self._last_probe: dict[int, float] = {}
@@ -72,6 +84,8 @@ class Worker:
             with provider_key(job["model"]["provider"], self.keys.get(job["id"])):
                 if job["kind"] == "backtest":
                     self._backtest(job)
+                elif job["kind"] == "radar":
+                    self._radar(job)
                 else:
                     self._analysis(job)
             self.keys.drop(job["id"])
@@ -127,6 +141,21 @@ class Worker:
             book.record_decision(self.store, pid, job["id"], job["ticker"], job["trade_date"], rating, plan)
             book.fill_pending(self.store, self.prices, pid)
 
+    def _symbol_ok(self, ticker: str) -> bool:
+        if ticker not in self._symbols:
+            self._symbols[ticker] = self.prices.currency(ticker) is not None
+        return self._symbols[ticker]
+
+    def _radar(self, job: dict) -> None:
+        """Read pending signals with the job's model, then queue the top picks in the radar portfolio."""
+        stored = radar.process(self.store, self.ask_factory(self._config(job)), self._symbol_ok)
+        jobs.add_event(self.store, job["id"], "Radar", "end", f"{stored} menções a ações encontradas")
+        picks = radar.pick(self.store, self.prices.currency)
+        ids = radar.enqueue_picks(self.store, picks, job["model"], job["analysts"], time.strftime("%Y-%m-%d"))
+        for jid in ids:
+            self.keys.put(jid, self.keys.get(job["id"]))
+        jobs.mark(self.store, job["id"], "done", payload={"hits": stored, "picks": picks, "jobs": ids})
+
     def _backtest(self, job: dict) -> None:
         bt = self.store.one("select * from backtests where job_id=?", (job["id"],))
         tickers = json.loads(bt["tickers_json"])
@@ -147,13 +176,16 @@ class Worker:
         jobs.mark(self.store, job["id"], "done")
 
     def _loop(self) -> None:
-        last_fill = 0.0
+        last_fill = last_collect = 0.0
         while not self._stop.is_set():
             try:
                 worked = self.run_once()
                 if time.monotonic() - last_fill > FILL_EVERY_S:
                     book.fill_pending(self.store, self.prices)
                     last_fill = time.monotonic()
+                if time.monotonic() - last_collect > COLLECT_EVERY_S:
+                    last_collect = time.monotonic()
+                    self.collect_fn(self.store)
             except Exception:  # never let the loop die
                 logger.exception("worker loop")
                 worked = False
