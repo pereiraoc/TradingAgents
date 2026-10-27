@@ -12,9 +12,10 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from .. import jobs
+from ..llm import scrub
 from ..store import Store, now
 from . import sources
 
@@ -45,10 +46,16 @@ Headline: {title}
 {body}"""
 
 
+def utcnow() -> datetime:
+    """Naive UTC: signal timestamps are stored as UTC wall time."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 def get_config(store: Store) -> dict:
     row = store.one("select json from radar_config where id=1")
     saved = json.loads(row["json"]) if row else {}
-    return {**DEFAULT_CONFIG, **saved, "sources": {**DEFAULT_CONFIG["sources"], **saved.get("sources", {})}}
+    srcs = saved.get("sources") if isinstance(saved.get("sources"), dict) else {}
+    return {**DEFAULT_CONFIG, **saved, "sources": {**DEFAULT_CONFIG["sources"], **srcs}}
 
 
 def set_config(store: Store, patch: dict) -> dict:
@@ -99,15 +106,24 @@ def collect(store: Store, fetch: sources.Fetch | None = None) -> dict:
 
 
 def parse_hits(text: str) -> list[dict]:
-    """The model's JSON answer, tolerant of prose or think-blocks around it."""
+    """The model's JSON answer, tolerant of prose or think-blocks around it.
+
+    Raises ValueError when there is no readable JSON object, so the caller can tell
+    "nothing affected" (empty list) from "garbled answer" (try again later).
+    """
     text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(0))
-    except ValueError:
-        return []
+    decoder, data, pos = json.JSONDecoder(), None, text.find("{")
+    while pos >= 0:
+        try:
+            data = decoder.raw_decode(text, pos)[0]
+        except ValueError:
+            pos = text.find("{", pos + 1)
+            continue
+        if isinstance(data, dict) and "hits" in data:
+            break
+        data, pos = None, text.find("{", pos + 1)
+    if data is None:
+        raise ValueError("resposta sem JSON legível")
     out = []
     for h in data.get("hits", []) if isinstance(data, dict) else []:
         try:
@@ -126,7 +142,7 @@ def process(store: Store, ask, symbol_ok, limit: int = PROCESS_LIMIT) -> int:
     """Have the model read unprocessed free-text signals, newest first. Returns hits stored."""
     stored = 0
     # past the ranking window a signal no longer matters: don't let it pile up as "pending"
-    stale = (datetime.now() - timedelta(days=STALE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    stale = (utcnow() - timedelta(days=STALE_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
     store.run("update radar_signals set processed=1 where processed=0 and ts<?", (stale,))
     rows = store.all("select * from radar_signals where processed=0 order by ts desc limit ?", (limit,))
     for s in rows:
@@ -134,8 +150,8 @@ def process(store: Store, ask, symbol_ok, limit: int = PROCESS_LIMIT) -> int:
                                ts=s["ts"], title=s["title"], body=(s["body"] or "")[:1200])
         try:
             hits = [h for h in parse_hits(ask(prompt)) if symbol_ok(h["ticker"])]
-        except Exception as exc:  # model hiccup: leave it for the next run
-            logger.warning("radar: model failed on signal %s: %s", s["id"], exc)
+        except Exception as exc:  # model hiccup or garbled answer: leave it for the next run
+            logger.warning("radar: model failed on signal %s: %s", s["id"], scrub(str(exc), None))
             continue
         for h in hits:
             store.run("insert into radar_hits(signal_id, ticker, direction, strength, reason) values (?,?,?,?,?)",
@@ -146,7 +162,7 @@ def process(store: Store, ask, symbol_ok, limit: int = PROCESS_LIMIT) -> int:
 
 
 def ranking(store: Store, at: datetime | None = None, days: int = 7, limit: int = 25) -> list[dict]:
-    at = at or datetime.now()
+    at = at or utcnow()
     since = (at - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
     rows = store.all(
         "select h.ticker, h.direction, h.strength, h.reason, s.id sid, s.source, s.actor, s.title, s.url, s.ts"
@@ -158,18 +174,21 @@ def ranking(store: Store, at: datetime | None = None, days: int = 7, limit: int 
         except ValueError:
             age = days
         weight = SOURCE_WEIGHT.get(r["source"], 0.5) * 0.5 ** (age / HALF_LIFE_DAYS)
-        b = board.setdefault(r["ticker"], {"ticker": r["ticker"], "score": 0.0, "n": 0, "sources": set(),
+        b = board.setdefault(r["ticker"], {"ticker": r["ticker"], "score": 0.0, "n": 0, "by_source": {},
                                            "last_ts": r["ts"], "signals": []})
         b["score"] += r["direction"] * r["strength"] * weight
         b["n"] += 1
-        b["sources"].add(r["source"])
+        b["by_source"][r["source"]] = b["by_source"].get(r["source"], 0.0) + r["direction"] * r["strength"] * weight
         if len(b["signals"]) < 6:
             b["signals"].append({k: r[k] for k in ("sid", "source", "actor", "title", "url", "ts", "direction", "reason")})
     out = []
     for b in board.values():
-        # agreement across independent sources counts more than many items from one feed
-        b["score"] = round(b["score"] * (1 + 0.25 * (len(b["sources"]) - 1)), 3)
-        b["sources"] = sorted(b["sources"])
+        # agreement across independent sources counts more than many items from one feed;
+        # a source pointing the other way is not agreement
+        net = b.pop("by_source")
+        agree = sum(1 for v in net.values() if v * b["score"] > 0)
+        b["score"] = round(b["score"] * (1 + 0.25 * max(0, agree - 1)), 3)
+        b["sources"] = sorted(net)
         out.append(b)
     return sorted(out, key=lambda b: abs(b["score"]), reverse=True)[:limit]
 
@@ -183,7 +202,7 @@ def pick(store: Store, currency_of, at: datetime | None = None) -> list[str]:
     p = store.one("select currency from portfolios where id=?", (pid,))
     if not p:
         return []
-    at = at or datetime.now()
+    at = at or utcnow()
     since = (at - timedelta(days=cfg["cooldown_days"])).strftime("%Y-%m-%d")
     recent = {r["ticker"] for r in store.all(
         "select ticker from jobs where portfolio_id=? and trade_date>=?", (pid, since))}

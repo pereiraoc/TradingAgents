@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 from tradingagents.portfolio import PortfolioContext, Position
 
@@ -10,6 +11,7 @@ from . import sizing
 from .fills import PriceSource, _shift, close_on_or_before, next_close
 from .store import Store, now
 
+logger = logging.getLogger(__name__)
 BENCHMARKS = {"BRL": "^BVSP", "USD": "SPY"}
 
 
@@ -77,6 +79,9 @@ def record_decision(store: Store, pid: int, job_id: int, ticker: str, trade_date
                     rating: str, trader_plan: str | None) -> int | None:
     if rating == "REVIEW":
         return None
+    existing = store.one("select id from trades where job_id=?", (job_id,))
+    if existing:  # a re-run of the same job must not trade twice
+        return existing["id"]
     status, reason = ("skipped", "hold") if rating == "Hold" else ("pending", None)
     return store.run(
         "insert into trades(portfolio_id, job_id, ticker, trade_date, rating, trader_plan, status, reason)"
@@ -96,25 +101,31 @@ def fill_pending(store: Store, prices: PriceSource, pid: int | None = None) -> i
         sql, args = sql + " and portfolio_id=?", [pid]
     filled = 0
     for t in store.all(sql + " order by trade_date, id", args):
-        nc = next_close(prices, t["ticker"], t["trade_date"])
-        if nc is None:
-            continue
-        fill_date, price = nc
-        p = get(store, t["portfolio_id"])
-        target = sizing.decide_target(t["rating"], t["trader_plan"], p["weights"])
-        held = holdings(store, p["id"]).get(t["ticker"], {}).get("quantity", 0)
-        delta = sizing.order_delta(target, held, cash(store, p["id"]),
-                                   _value_on(store, p["id"], prices, fill_date), price,
-                                   t["rating"] in sizing.BULLISH)
-        if delta == 0:
-            store.run("update trades set status='skipped', reason=?, sizing_source=?, fill_date=?, price=? where id=?",
-                      ("sem mudança (alvo atingido ou sem caixa)", target.source, fill_date, price, t["id"]))
-            continue
-        store.run("update trades set status='filled', side=?, quantity=?, price=?, fill_date=?, sizing_source=?"
-                  " where id=?", ("buy" if delta > 0 else "sell", abs(delta), price, fill_date, target.source, t["id"]))
-        filled += 1
+        try:
+            filled += _fill(store, prices, t)
+        except Exception:  # one ticker the price feed chokes on must not hold up the others
+            logger.exception("fill of trade %s failed", t["id"])
     return filled
 
+
+def _fill(store: Store, prices: PriceSource, t: dict) -> int:
+    nc = next_close(prices, t["ticker"], t["trade_date"])
+    if nc is None:
+        return 0
+    fill_date, price = nc
+    p = get(store, t["portfolio_id"])
+    target = sizing.decide_target(t["rating"], t["trader_plan"], p["weights"])
+    held = holdings(store, p["id"]).get(t["ticker"], {}).get("quantity", 0)
+    delta = sizing.order_delta(target, held, cash(store, p["id"]),
+                               _value_on(store, p["id"], prices, fill_date), price,
+                               t["rating"] in sizing.BULLISH)
+    if delta == 0:
+        store.run("update trades set status='skipped', reason=?, sizing_source=?, fill_date=?, price=? where id=?",
+                  ("sem mudança (alvo atingido ou sem caixa)", target.source, fill_date, price, t["id"]))
+        return 0
+    store.run("update trades set status='filled', side=?, quantity=?, price=?, fill_date=?, sizing_source=?"
+              " where id=?", ("buy" if delta > 0 else "sell", abs(delta), price, fill_date, target.source, t["id"]))
+    return 1
 
 def snapshot(store: Store, pid: int, prices: PriceSource, today: str) -> dict:
     p = get(store, pid)

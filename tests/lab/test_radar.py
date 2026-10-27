@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tests.lab.fakes import FakePrices
@@ -74,7 +75,52 @@ def test_parse_hits_tolerates_noise():
     text = '<think>hmm</think> Sure: {"hits":[{"ticker":"tsla","direction":1,"strength":0.8,"reason":"post"},' \
            '{"ticker":"bad ticker!","direction":1}]}'
     assert radar.parse_hits(text) == [{"ticker": "TSLA", "direction": 1, "strength": 0.8, "reason": "post"}]
-    assert radar.parse_hits("no json here") == []
+    assert radar.parse_hits('{"hits": []}') == []
+    # prose with braces after the answer does not lose it
+    assert radar.parse_hits('{"hits":[{"ticker":"NVDA","direction":-1}]} note: {see above}')[0]["ticker"] == "NVDA"
+    with pytest.raises(ValueError):   # garbled: the signal stays unread for the next run
+        radar.parse_hits("no json here")
+
+
+def test_garbled_answer_leaves_signal_unread(tmp_path):
+    s = Store(tmp_path / "l.sqlite")
+    radar._insert(s, {"source": "bloomberg", "uid": "u1", "ts": radar.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+                      "title": "x"})
+    assert radar.process(s, lambda p: "sorry, {truncated", lambda t: True) == 0
+    assert s.one("select processed from radar_signals")["processed"] == 0
+
+
+def test_sources_dates_to_utc_and_bad_congress_rows_skipped():
+    assert sources._iso("Mon, 26 Oct 2026 22:00:00 -0400") == "2026-10-27T02:00:00"
+    assert sources._iso("2026-10-26T18:00:00-04:00") == "2026-10-26T22:00:00"
+    bad = json.dumps({"trades": [
+        {"member": "A", "ticker": "AAA", "type": "purchase"},                                  # no date
+        {"member": "B", "ticker": "BBB", "type": "sale", "disclosure_date": "2026-10-20", "amount_high": "$1,000"},
+        {"member": "C", "ticker": "CCC", "type": "purchase", "disclosure_date": "soon"},
+    ]}).encode()
+    rows = sources.congress(lambda u: bad)
+    assert [r["hits"][0]["ticker"] for r in rows] == ["BBB"] and rows[0]["ts"] == "2026-10-20T00:00:00"
+
+
+def test_opposing_sources_get_no_agreement_bonus(tmp_path):
+    s = Store(tmp_path / "l.sqlite")
+    ts = radar.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    radar._insert(s, {"source": "bloomberg", "uid": "a", "ts": ts, "title": "a",
+                      "hits": [{"ticker": "ZZZ", "direction": 1, "strength": 0.9}]})
+    radar._insert(s, {"source": "congress", "uid": "b", "ts": ts, "title": "b",
+                      "hits": [{"ticker": "ZZZ", "direction": -1, "strength": 0.5}]})
+    b = radar.ranking(s)[0]
+    assert b["score"] == round(0.9 - 0.5 * 0.6, 3) and b["sources"] == ["bloomberg", "congress"]
+
+
+def test_radar_config_rejects_bad_values(tmp_path):
+    s = Store(tmp_path / "l.sqlite")
+    c = TestClient(create_app(s, type("W", (), {"current": None})(), KeyVault(), FakePrices({})))
+    assert c.post("/radar/config", json={"sources": "x"}).status_code == 422
+    assert c.post("/radar/config", json={"top_n": "três"}).status_code == 422
+    assert c.post("/radar/config", json={"portfolio_id": 99}).status_code == 404
+    assert c.post("/radar/config", json={"top_n": 5, "figures": [{"name": "Lula", "lang": "pt"}]}).json()["top_n"] == 5
+    assert radar.get_config(s)["sources"]["bloomberg"] is True
 
 
 def test_process_ranking_and_pick(tmp_path):

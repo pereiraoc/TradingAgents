@@ -48,6 +48,27 @@ def test_replay_portfolio_enqueues_chain(tmp_path):
     assert len(rows) == 3 and rows[0]["after_id"] == rows[1]["id"]
 
 
+def test_refused_replay_leaves_no_portfolio(tmp_path):
+    c, s, _ = client(tmp_path)
+    r = c.post("/portfolios", json={"name": "r", "currency": "BRL", "initial_cash": 1000, "mode": "replay",
+                                    "replay": {"tickers": ["NVDA"], "start": "2026-06-01", "end": "2026-06-15",
+                                               "model": MODEL, "api_key": "sk-abcdef123"}})
+    assert r.status_code == 400 and c.get("/portfolios").json()["portfolios"] == []
+
+
+def test_validation_error_does_not_echo_the_key(tmp_path):
+    c, s, _ = client(tmp_path)
+    r = c.post("/jobs", json={"date": "2026-06-01", "model": MODEL, "api_key": "sk-supersecret"})
+    assert r.status_code == 422 and "sk-supersecret" not in r.text
+
+
+def test_watchlist_update_keeps_id(tmp_path):
+    c, s, _ = client(tmp_path)
+    a = c.post("/watchlists", json={"name": "br", "tickers": ["PETR4"]}).json()["id"]
+    b = c.post("/watchlists", json={"name": "br", "tickers": ["VALE3"]}).json()["id"]
+    assert a == b and c.get("/watchlists").json()["watchlists"][0]["tickers"] == ["VALE3.SA"]
+
+
 def test_watchlist_and_backtest(tmp_path):
     c, s, _ = client(tmp_path)
     wid = c.post("/watchlists", json={"name": "br", "tickers": ["PETR4.SA", "VALE3.SA"]}).json()["id"]

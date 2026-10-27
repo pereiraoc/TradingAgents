@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -65,3 +66,10 @@ def provider_key(provider: str, key: str | None):
             os.environ.pop(name, None)
         else:
             os.environ[name] = old
+
+
+def scrub(text: str, key: str | None) -> str:
+    """Error text as stored and shown: never the key, nor anything shaped like one."""
+    if key:
+        text = text.replace(key, "***")
+    return re.sub(r"(sk-[A-Za-z0-9_\-]{6,}|Bearer\s+\S+)", "***", text)

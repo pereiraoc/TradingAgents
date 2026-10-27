@@ -14,7 +14,7 @@ from tradingagents.reporting import write_report_tree
 
 from . import book, jobs, radar
 from .fills import PriceSource
-from .llm import KeyVault, build_config, provider_key
+from .llm import KeyVault, build_config, provider_key, scrub
 from .runner import run_analysis
 from .store import Store
 
@@ -70,11 +70,15 @@ class Worker:
         self.waiting: int | None = None
         self._wait_since: dict[int, float] = {}
         self._last_probe: dict[int, float] = {}
+        self._last_fill = self._last_collect = -float("inf")
 
     def recover(self) -> None:
         jobs.recover(self.store, self.keys.has)
 
     def run_once(self) -> bool:
+        stale = self.store.one("select id from jobs where status='running'")
+        if stale and self.current is None:  # the failure handler itself died: don't block the queue
+            jobs.mark(self.store, stale["id"], "failed", error="interrompido — use 'tentar de novo'")
         job = jobs.next_runnable(self.store)
         if job is None or not self._model_ready(job):
             return False
@@ -90,8 +94,9 @@ class Worker:
                     self._analysis(job)
             self.keys.drop(job["id"])
         except Exception as exc:  # the job fails, the worker goes on
-            logger.exception("job %s failed", job["id"])
-            jobs.mark(self.store, job["id"], "failed", error=str(exc)[:2000])
+            error = scrub(str(exc), self.keys.get(job["id"]))[:2000]
+            logger.error("job %s failed: %s", job["id"], error)
+            jobs.mark(self.store, job["id"], "failed", error=error)
         finally:
             self.current = None
         return True
@@ -135,11 +140,12 @@ class Worker:
             jobs.mark(self.store, job["id"], "review", rating=rating, report_dir=str(report_dir),
                       payload={"trader_plan": plan})
             return
+        if pid:  # before 'done': a crash in between must not leave a finished job without its trade
+            book.record_decision(self.store, pid, job["id"], job["ticker"], job["trade_date"], rating, plan)
         jobs.mark(self.store, job["id"], "done", rating=rating, report_dir=str(report_dir),
                   payload={"trader_plan": plan})
         if pid:
-            book.record_decision(self.store, pid, job["id"], job["ticker"], job["trade_date"], rating, plan)
-            book.fill_pending(self.store, self.prices, pid)
+            book.fill_pending(self.store, self.prices, pid)   # per-trade guarded; the hourly sweep retries
 
     def _symbol_ok(self, ticker: str) -> bool:
         if ticker not in self._symbols:
@@ -176,21 +182,27 @@ class Worker:
         jobs.mark(self.store, job["id"], "done")
 
     def _loop(self) -> None:
-        last_fill = last_collect = 0.0
         while not self._stop.is_set():
-            try:
-                worked = self.run_once()
-                if time.monotonic() - last_fill > FILL_EVERY_S:
-                    book.fill_pending(self.store, self.prices)
-                    last_fill = time.monotonic()
-                if time.monotonic() - last_collect > COLLECT_EVERY_S:
-                    last_collect = time.monotonic()
-                    self.collect_fn(self.store)
-            except Exception:  # never let the loop die
-                logger.exception("worker loop")
-                worked = False
+            worked = False
+            for step in (self.run_once, self._hourly_fill, self._hourly_collect):
+                try:
+                    worked = step() or worked
+                except Exception:  # never let the loop die, nor one chore starve the others
+                    logger.exception("worker loop: %s", step.__name__)
             if not worked:
                 self._stop.wait(2)
+
+    def _hourly_fill(self) -> bool:
+        if time.monotonic() - self._last_fill > FILL_EVERY_S:
+            self._last_fill = time.monotonic()   # set first: a failing feed waits an hour, not 2 s
+            book.fill_pending(self.store, self.prices)
+        return False
+
+    def _hourly_collect(self) -> bool:
+        if time.monotonic() - self._last_collect > COLLECT_EVERY_S:
+            self._last_collect = time.monotonic()
+            self.collect_fn(self.store)
+        return False
 
     def start(self) -> None:
         self.recover()

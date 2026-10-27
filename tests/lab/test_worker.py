@@ -66,6 +66,27 @@ def test_failure_marks_failed(tmp_path, monkeypatch):
     assert jobs.get(s, jid)["status"] == "failed" and "yahoo down" in jobs.get(s, jid)["error"]
 
 
+def test_failure_text_never_carries_the_key(tmp_path, monkeypatch):
+    s, keys, w = make(tmp_path, monkeypatch)
+    import tradingagents.lab.worker as wm
+    monkeypatch.setattr(wm, "run_analysis",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("401 key=mykey123 hdr Bearer abc sk-zzzzzzzz")))
+    jid = jobs.enqueue(s, "analysis", ticker="NVDA", trade_date="2026-06-01", model=MODEL)
+    keys.put(jid, "mykey123")
+    w.run_once()
+    err = jobs.get(s, jid)["error"]
+    assert "mykey123" not in err and "abc" not in err and "sk-zzzz" not in err
+
+
+def test_orphan_running_job_does_not_block_queue(tmp_path, monkeypatch):
+    s, keys, w = make(tmp_path, monkeypatch)
+    stuck = jobs.enqueue(s, "analysis", ticker="NVDA", trade_date="2026-06-01", model={**MODEL, "needs_key": False})
+    jobs.mark(s, stuck, "running")
+    nxt = jobs.enqueue(s, "analysis", ticker="NVDA", trade_date="2026-06-08", model={**MODEL, "needs_key": False})
+    assert w.run_once() is True
+    assert jobs.get(s, stuck)["status"] == "failed" and jobs.get(s, nxt)["status"] == "done"
+
+
 def test_replay_chain_passes_portfolio_of_the_moment(tmp_path, monkeypatch):
     s, keys, w = make(tmp_path, monkeypatch)
     FakeGraph.contexts.clear()

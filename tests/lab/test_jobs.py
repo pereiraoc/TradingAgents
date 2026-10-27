@@ -26,6 +26,7 @@ def test_failed_predecessor_blocks_chain(tmp_path):
     jobs.enqueue(s, "analysis", ticker="NVDA", trade_date="2026-06-08", model=MODEL, after_id=a)
     jobs.mark(s, a, "failed", error="boom")
     assert jobs.next_runnable(s) is None
+    assert jobs.listing(s, "queued")[0]["blocked_by"] == a   # shown as "parado: #a falhou"
 
 
 def test_recover(tmp_path):

@@ -13,6 +13,29 @@ PRICES = FakePrices({
 def test_next_close_skips_trade_date():
     assert next_close(PRICES, "NVDA", "2026-06-01") == ("2026-06-02", 110.0)
     assert next_close(PRICES, "NVDA", "2026-06-03") is None
+    # the session still trading today is not a close yet
+    assert next_close(PRICES, "NVDA", "2026-06-01", today="2026-06-02") is None
+
+
+def test_same_job_never_trades_twice(tmp_path):
+    s = Store(tmp_path / "l.sqlite")
+    pid = book.create(s, "p", "USD", 1000)
+    a = book.record_decision(s, pid, 7, "NVDA", "2026-06-01", "Buy", BUY5)
+    assert book.record_decision(s, pid, 7, "NVDA", "2026-06-01", "Buy", BUY5) == a
+    assert s.one("select count(*) n from trades")["n"] == 1
+
+
+def test_one_bad_ticker_does_not_stop_fills(tmp_path):
+    class Flaky(FakePrices):
+        def closes(self, ticker, start, end):
+            if ticker == "BAD":
+                raise RuntimeError("yahoo")
+            return super().closes(ticker, start, end)
+    s = Store(tmp_path / "l.sqlite")
+    pid = book.create(s, "p", "USD", 1000)
+    book.record_decision(s, pid, 1, "BAD", "2026-06-01", "Buy", BUY5)
+    book.record_decision(s, pid, 2, "NVDA", "2026-06-01", "Buy", BUY5)
+    assert book.fill_pending(s, Flaky(PRICES.data), pid) == 1
 
 
 def test_buy_fills_next_close_and_values(tmp_path):

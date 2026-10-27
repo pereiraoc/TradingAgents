@@ -13,6 +13,7 @@ import math
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote_plus
 
@@ -34,13 +35,22 @@ def http_fetch(url: str) -> bytes:
     return response.content
 
 
+def _utc(dt: datetime) -> str:
+    """Stored timestamps are naive UTC; a zone-less one is taken as UTC already."""
+    if dt.tzinfo:
+        dt = dt.astimezone(UTC)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def _iso(text: str | None) -> str:
-    if not text:
-        return time.strftime("%Y-%m-%dT%H:%M:%S")
-    try:
-        return parsedate_to_datetime(text).strftime("%Y-%m-%dT%H:%M:%S")
-    except (TypeError, ValueError):
-        return text[:19]
+    """RSS pubDate (RFC 822) or ISO 8601 -> UTC; unreadable -> now."""
+    if text:
+        for parse in (parsedate_to_datetime, datetime.fromisoformat):
+            try:
+                return _utc(parse(text.strip()))
+            except (TypeError, ValueError):
+                pass
+    return _utc(datetime.now(UTC))
 
 
 def _rss(raw: bytes, source: str, actor: str | None = None) -> list[dict]:
@@ -87,23 +97,38 @@ def congress(fetch: Fetch) -> list[dict]:
     data = json.loads(fetch(CONGRESS_URL))
     out = []
     for t in data.get("trades", []):
-        ticker = (t.get("ticker") or "").strip().upper()
-        kind = (t.get("type") or "").lower()
-        if not ticker or kind not in ("purchase", "sale"):
+        try:
+            out.append(_congress_trade(t))
+        except (TypeError, ValueError):  # one odd row must not drop the whole source
             continue
-        direction = 1 if kind == "purchase" else -1
-        verb = "comprou" if direction > 0 else "vendeu"
-        out.append({
-            "source": "congress", "ts": f"{t.get('disclosure_date') or t.get('transaction_date')}T00:00:00",
-            "uid": f"congress:{t.get('member_slug')}:{ticker}:{t.get('transaction_date')}:{kind}:{t.get('amount_range')}",
-            "actor": t.get("member"), "url": t.get("filing_portal") or "",
-            "title": f"{t.get('member')} ({t.get('chamber')}) {verb} {ticker} {t.get('amount_range') or ''}".strip(),
-            "body": f"transação em {t.get('transaction_date')}, declarada em {t.get('disclosure_date')}; {t.get('asset') or ''}",
-            "hits": [{"ticker": ticker, "direction": direction,
-                      "strength": _amount_strength(float(t.get("amount_high") or t.get("amount_low") or 0)),
-                      "reason": f"congressista {verb}"}],
-        })
-    return out
+    return [s for s in out if s]
+
+
+def _amount(value) -> float:
+    if isinstance(value, str):
+        value = value.replace("$", "").replace(",", "").strip()
+    return float(value or 0)
+
+
+def _congress_trade(t: dict) -> dict | None:
+    ticker = (t.get("ticker") or "").strip().upper()
+    kind = (t.get("type") or "").lower()
+    day = t.get("disclosure_date") or t.get("transaction_date")
+    if not ticker or kind not in ("purchase", "sale") or not day:
+        return None
+    datetime.fromisoformat(str(day)[:10])   # ValueError -> row skipped
+    direction = 1 if kind == "purchase" else -1
+    verb = "comprou" if direction > 0 else "vendeu"
+    return {
+        "source": "congress", "ts": f"{str(day)[:10]}T00:00:00",
+        "uid": f"congress:{t.get('member_slug')}:{ticker}:{t.get('transaction_date')}:{kind}:{t.get('amount_range')}",
+        "actor": t.get("member"), "url": t.get("filing_portal") or "",
+        "title": f"{t.get('member')} ({t.get('chamber')}) {verb} {ticker} {t.get('amount_range') or ''}".strip(),
+        "body": f"transação em {t.get('transaction_date')}, declarada em {t.get('disclosure_date')}; {t.get('asset') or ''}",
+        "hits": [{"ticker": ticker, "direction": direction,
+                  "strength": _amount_strength(_amount(t.get("amount_high") or t.get("amount_low"))),
+                  "reason": f"congressista {verb}"}],
+    }
 
 
 def _form4(xml: bytes) -> dict | None:
@@ -150,7 +175,7 @@ def insiders(fetch: Fetch, limit: int = 40, pause: float = 0.15) -> list[dict]:
         value = parsed["bought"] if buy else parsed["sold"]
         who = f"{parsed['owner']}{' (' + parsed['title'] + ')' if parsed['title'] else ''}"
         out.append({
-            "source": "insider", "uid": f"insider:{accession}", "ts": (entry.findtext(f"{ATOM}updated") or "")[:19],
+            "source": "insider", "uid": f"insider:{accession}", "ts": _iso(entry.findtext(f"{ATOM}updated")),
             "actor": parsed["owner"], "url": link,
             "title": f"{who} {'comprou' if buy else 'vendeu'} US$ {value:,.0f} de {parsed['ticker']}",
             "body": "Form 4 (SEC)",

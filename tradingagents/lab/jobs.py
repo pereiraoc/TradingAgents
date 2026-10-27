@@ -29,14 +29,18 @@ def enqueue(store: Store, kind: str, *, ticker=None, trade_date=None, analysts=(
 
 
 def get(store: Store, job_id: int) -> dict | None:
-    return _decode(store.one("select * from jobs where id=?", (job_id,)))
+    return _decode(store.one(f"select j.*, {_BLOCKED} from jobs j where id=?", (job_id,)))
+
+
+# a chained job whose predecessor failed waits for it to be retried ("tentar de novo")
+_BLOCKED = "(select a.id from jobs a where a.id=j.after_id and a.status='failed') blocked_by"
 
 
 def listing(store: Store, status: str | None = None, limit: int = 100) -> list[dict]:
     if status:
-        rows = store.all("select * from jobs where status=? order by id desc limit ?", (status, limit))
+        rows = store.all(f"select j.*, {_BLOCKED} from jobs j where status=? order by id desc limit ?", (status, limit))
     else:
-        rows = store.all("select * from jobs order by id desc limit ?", (limit,))
+        rows = store.all(f"select j.*, {_BLOCKED} from jobs j order by id desc limit ?", (limit,))
     return [_decode(r) for r in rows]
 
 

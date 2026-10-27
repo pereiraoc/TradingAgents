@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 
@@ -29,9 +29,12 @@ class YahooPrices:
         return get_currency(ticker)
 
 
-def next_close(prices: PriceSource, ticker: str, day: str) -> tuple[str, float] | None:
+def next_close(prices: PriceSource, ticker: str, day: str, today: str | None = None) -> tuple[str, float] | None:
+    """First close after ``day``. Today's bar is still moving (its "close" is the live price), so a
+    session only counts once the UTC date has moved past it."""
+    today = today or datetime.now(UTC).strftime("%Y-%m-%d")
     for d, p in prices.closes(ticker, _shift(day, 1), _shift(day, 12)):
-        if d > day:
+        if day < d < today:
             return d, p
     return None
 

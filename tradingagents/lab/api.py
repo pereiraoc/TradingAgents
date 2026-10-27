@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 from datetime import date as _date
 from pathlib import Path
+from typing import Literal
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
 from tradingagents import __version__
 
@@ -76,6 +78,20 @@ class RadarRunIn(BaseModel):
     analysts: list[str] = []
 
 
+class FigureIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    lang: Literal["en", "pt"] = "en"
+
+
+class RadarConfigIn(BaseModel):
+    figures: list[FigureIn] | None = None
+    sources: dict[str, bool] | None = None
+    portfolio_id: int | None = None
+    top_n: int | None = Field(None, ge=1, le=20)
+    min_score: float | None = Field(None, ge=0)
+    cooldown_days: int | None = Field(None, ge=0, le=365)
+
+
 class BacktestIn(BaseModel):
     tickers: list[str]
     start: str
@@ -95,6 +111,12 @@ def _model(d: dict, api_key: str | None) -> dict:
 
 def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> FastAPI:
     app = FastAPI(title="TradingAgents Lab")
+
+    @app.exception_handler(RequestValidationError)
+    def invalid(_: Request, exc: RequestValidationError):
+        # FastAPI's default echoes the request body ("input"), which can carry api_key
+        return JSONResponse({"detail": [{"loc": e.get("loc"), "msg": e.get("msg")} for e in exc.errors()]},
+                            status_code=422)
 
     def check_currency(pid: int | None, ticker: str) -> None:
         if pid is None:
@@ -126,7 +148,7 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
                               body.api_key, body.portfolio_id)}
 
     @app.get("/jobs")
-    def list_jobs(status: str | None = None, limit: int = 100):
+    def list_jobs(status: str | None = None, limit: int = Query(100, ge=1, le=1000)):
         return {"jobs": jobs.listing(store, status, limit)}
 
     @app.get("/jobs/{jid}")
@@ -188,14 +210,17 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
         if body.mode == "replay" and not body.replay:
             raise HTTPException(400, "reencenação precisa de período e ações")
         r = body.replay
+        if r:  # validate everything before the portfolio exists: a refusal leaves nothing behind
+            tickers = [normalize(t) for t in r.tickers]
+            model = _model(r.model, r.api_key)
+            for t in tickers:
+                cur = prices.currency(t)
+                if cur and cur.upper() != body.currency.upper():
+                    raise HTTPException(400, f"{t} é cotado em {cur}; a carteira é em {body.currency.upper()}")
         pid = book.create(store, body.name, body.currency, body.initial_cash, body.benchmark, body.mode,
                           r.model_dump(exclude={"api_key"}) if r else None, body.weights)
         if r:
-            tickers = [normalize(t) for t in r.tickers]
-            for t in tickers:
-                check_currency(pid, t)
-            ids = replay.schedule(store, pid, tickers, r.start, r.end, r.every_days,
-                                  r.analysts, _model(r.model, r.api_key))
+            ids = replay.schedule(store, pid, tickers, r.start, r.end, r.every_days, r.analysts, model)
             for jid in ids:
                 keys.put(jid, r.api_key)
         return {"id": pid}
@@ -224,8 +249,9 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
     @app.post("/watchlists")
     def add_watchlist(body: WatchlistIn):
         tickers = [normalize(t) for t in body.tickers if t.strip()]
-        return {"id": store.run("insert or replace into watchlists(name, tickers_json) values (?,?)",
-                                (body.name, json.dumps(tickers)))}
+        store.run("insert into watchlists(name, tickers_json) values (?,?)"
+                  " on conflict(name) do update set tickers_json=excluded.tickers_json", (body.name, json.dumps(tickers)))
+        return {"id": store.one("select id from watchlists where name=?", (body.name,))["id"]}   # id kept on update
 
     @app.delete("/watchlists/{wid}")
     def delete_watchlist(wid: int):
@@ -266,7 +292,7 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
         return {"results": results}
 
     @app.get("/radar")
-    def radar_view(days: int = 7):
+    def radar_view(days: int = Query(7, ge=1, le=90)):
         signals = store.all("select * from radar_signals order by ts desc limit 80")
         for sig in signals:
             sig["hits"] = store.all("select ticker, direction, strength, reason from radar_hits where signal_id=?",
@@ -276,9 +302,14 @@ def create_app(store: Store, worker, keys: KeyVault, prices: PriceSource) -> Fas
                 "config": radar.get_config(store)}
 
     @app.post("/radar/config")
-    def radar_config(patch: dict):
-        allowed = {k: v for k, v in patch.items() if k in radar.DEFAULT_CONFIG}
-        return radar.set_config(store, allowed)
+    def radar_config(patch: RadarConfigIn):
+        data = patch.model_dump(exclude_unset=True)
+        if data.get("portfolio_id") is not None and not book.get(store, data["portfolio_id"]):
+            raise HTTPException(404, "carteira não existe")
+        for k in ("figures", "sources", "top_n", "min_score", "cooldown_days"):
+            if k in data and data[k] is None:
+                data.pop(k)
+        return radar.set_config(store, data)
 
     @app.post("/radar/collect")
     def radar_collect():
