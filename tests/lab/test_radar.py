@@ -69,6 +69,7 @@ def test_collect_is_idempotent_and_reports_failures(tmp_path):
     assert radar.collect(s, fetch)["bloomberg"] == 0
     bad = radar.collect(s, lambda u: (_ for _ in ()).throw(OSError("offline")))
     assert str(bad["bloomberg"]).startswith("falhou")
+    assert bad["congress"] == 1   # congress is not asked again within 6 h (daily cap of the free API)
 
 
 def test_parse_hits_tolerates_noise():

@@ -34,6 +34,8 @@ SOURCE_WEIGHT = {"bloomberg": 1.0, "figure_news": 1.0, "insider": 0.8, "congress
 HALF_LIFE_DAYS = 3.0
 PROCESS_LIMIT = 40
 STALE_DAYS = 2
+# disclosed trades arrive days to weeks late, and the free congress API has a daily cap
+MIN_INTERVAL_H = {"congress": 6}
 
 PROMPT = """You read one market news item and list the publicly traded companies it is likely to move.
 Answer ONLY with JSON: {{"hits": [{{"ticker": "<Yahoo Finance symbol, e.g. TSLA or PETR4.SA>", "direction": 1 or -1, "strength": <0 to 1>, "reason": "<at most 12 words>"}}]}}
@@ -92,16 +94,24 @@ def collect(store: Store, fetch: sources.Fetch | None = None) -> dict:
         "congress": lambda: sources.congress(fetch),
         "insider": lambda: sources.insiders(fetch),
     }
-    report = {}
+    report, last_ok = {}, dict(cfg.get("last_ok") or {})
     for name, run in plan.items():
         if not cfg["sources"].get(name):
             continue
+        hours = MIN_INTERVAL_H.get(name)
+        if hours and last_ok.get(name) and \
+                datetime.fromisoformat(now()) - datetime.fromisoformat(last_ok[name]) < timedelta(hours=hours):
+            report[name] = (cfg.get("last_report") or {}).get(name, 0)
+            continue
         try:
             report[name] = sum(_insert(store, s) for s in run())
+            last_ok[name] = now()
         except Exception as exc:  # offline, rate limited, format change
             logger.warning("radar source %s failed: %s", name, exc)
             report[name] = f"falhou: {exc}"[:200]
-    set_config(store, {"last_collect": now(), "last_report": report})
+            if "429" in str(exc):   # over the cap: back off like a success would
+                last_ok[name] = now()
+    set_config(store, {"last_collect": now(), "last_report": report, "last_ok": last_ok})
     return report
 
 
