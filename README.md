@@ -139,6 +139,8 @@ Install the package and its dependencies (`uv pip install .` with uv):
 pip install .
 ```
 
+> **Fork pereiraoc:** paper portfolios, a run queue and an HTTP API — see [docs/lab.md](docs/lab.md).
+
 ### Docker
 
 Alternatively, run with Docker:
