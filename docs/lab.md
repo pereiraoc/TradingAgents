@@ -61,3 +61,31 @@ GET/POST /backtests         {tickers, start, end, every_days, analysts?, model, 
 ```
 
 `model` = `{provider?: "openai_compatible", base_url, quick, deep?}`.
+
+## Radar
+
+Quais ações valem uma análise agora. A coleta roda sozinha de hora em hora (`POST /radar/collect`
+força) e não usa modelo:
+
+| Fonte | O quê | Atraso |
+|---|---|---|
+| Bloomberg | manchetes dos RSS públicos (markets, politics, technology, economics) | minutos |
+| Notícias sobre figuras | Google News sobre o que cada figura disse (lista editável, EN/PT) | minutos |
+| Congresso EUA | compras/vendas declaradas (Bargo, sem chave, limite diário) | até ~45 dias |
+| Executivos (SEC) | Form 4: compra no mercado (ou venda grande) da própria empresa | ~2 dias úteis |
+
+`POST /radar/run {model}` (job `radar`): a IA lê os sinais de texto → (ação, direção, força); o
+ranking soma os sinais dos últimos 7 dias com meia-vida de 3 dias, peso por fonte e bônus quando
+fontes diferentes concordam. Se `config.portfolio_id` estiver definido, as `top_n` ações de alta
+(pontuação ≥ `min_score`, moeda da carteira, sem repetir em `cooldown_days`) viram análises nessa
+carteira fictícia — é assim que se mede se seguir o Radar dá dinheiro.
+
+```
+GET  /radar?days=7          ranking, sinais recentes, pendentes, config
+POST /radar/config          {figures, sources, portfolio_id, top_n, min_score, cooldown_days}
+POST /radar/collect         coleta agora
+POST /radar/run             {model, api_key?, analysts?}
+GET  /search?q=             símbolos do Yahoo (+ ".SA" para código da B3)
+```
+
+Uma análise cujo modelo não responde **espera na fila** (até 2 h) em vez de falhar.
