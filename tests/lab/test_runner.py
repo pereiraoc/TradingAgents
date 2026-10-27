@@ -28,6 +28,7 @@ class FakeGraph:
         self.args = args
         yield [], {"market_report": "m"}
         yield [], None
+        yield [], {"investment_debate_state": {"bull_history": "bull case"}}
         yield [], {"market_report": "m", "final_trade_decision": "**Rating**: Buy", "trader_investment_plan": "p"}
 
     def record_decision(self, ticker, date, final):
@@ -39,8 +40,9 @@ class FakeGraph:
 
 def test_run_analysis_streams_events_and_rating():
     g, seen = FakeGraph(), []
-    final, rating = run_analysis(g, "NVDA", "2026-06-01", on_event=seen.append)
-    assert seen == ["Market Analyst", "Trader", "Portfolio Manager"]
+    final, rating = run_analysis(g, "NVDA", "2026-06-01", on_event=lambda a, t: seen.append((a, t)))
+    assert seen == [("Market Analyst", "m"), ("Bull Researcher", "bull case"), ("Trader", "p"),
+                    ("Portfolio Manager", "**Rating**: Buy")]
     assert rating == "Buy" and g.recorded is final and g.cleared
     assert g.args["config"]["configurable"]["thread_id"] == "tid-1"
 

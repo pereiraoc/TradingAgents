@@ -20,6 +20,22 @@ from .store import Store
 
 logger = logging.getLogger(__name__)
 FILL_EVERY_S = 3600
+MODEL_POLL_S = 15
+MODEL_WAIT_MAX_S = 2 * 3600
+
+
+def _default_model_up(model: dict, key: str | None) -> bool:
+    """An OpenAI-compatible server answers /models once it is serving."""
+    base = (model or {}).get("base_url")
+    if not base:
+        return True
+    import requests
+
+    try:
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        return requests.get(base.rstrip("/") + "/models", headers=headers, timeout=5).status_code < 500
+    except requests.RequestException:
+        return False
 
 
 def _default_graph(config: dict, analysts: list[str]):
@@ -30,7 +46,7 @@ def _default_graph(config: dict, analysts: list[str]):
 
 class Worker:
     def __init__(self, store: Store, data_dir: Path, *, prices: PriceSource, keys: KeyVault,
-                 graph_factory=None, backtest_fn=None, base_config: dict | None = None):
+                 graph_factory=None, backtest_fn=None, base_config: dict | None = None, model_up=None):
         self.store, self.data_dir, self.prices, self.keys = store, Path(data_dir), prices, keys
         self.graph_factory = graph_factory or _default_graph
         self.backtest_fn = backtest_fn or run_backtest
@@ -38,13 +54,17 @@ class Worker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.current: int | None = None
+        self.model_up = model_up or _default_model_up
+        self.waiting: int | None = None
+        self._wait_since: dict[int, float] = {}
+        self._last_probe: dict[int, float] = {}
 
     def recover(self) -> None:
         jobs.recover(self.store, self.keys.has)
 
     def run_once(self) -> bool:
         job = jobs.next_runnable(self.store)
-        if job is None:
+        if job is None or not self._model_ready(job):
             return False
         self.current = job["id"]
         jobs.mark(self.store, job["id"], "running")
@@ -62,6 +82,29 @@ class Worker:
             self.current = None
         return True
 
+    def _model_ready(self, job: dict) -> bool:
+        """A job whose model is not serving yet waits in the queue (up to MODEL_WAIT_MAX_S)."""
+        jid, now = job["id"], time.monotonic()
+        if now - self._last_probe.get(jid, -MODEL_POLL_S) < MODEL_POLL_S:
+            return False
+        self._last_probe[jid] = now
+        if self.model_up(job["model"], self.keys.get(jid)):
+            self._wait_since.pop(jid, None)
+            self._last_probe.pop(jid, None)
+            self.waiting = None
+            return True
+        if jid not in self._wait_since:
+            self._wait_since[jid] = now
+            jobs.add_event(self.store, jid, "Modelo", "wait",
+                           f"esperando {job['model'].get('quick')} responder (ligue no Cookbook)")
+        self.waiting = jid
+        if now - self._wait_since[jid] > MODEL_WAIT_MAX_S:
+            jobs.mark(self.store, jid, "failed",
+                      error="o modelo não respondeu em 2 h — ligue-o no Cookbook e use 'tentar de novo'")
+            self._wait_since.pop(jid, None)
+            self.waiting = None
+        return False
+
     def _config(self, job: dict) -> dict:
         return build_config(self.base_config, job["model"], self.data_dir)
 
@@ -70,7 +113,7 @@ class Worker:
         graph = self.graph_factory(self._config(job), job["analysts"])
         portfolio = book.context(self.store, pid) if pid else None
         final, rating = run_analysis(graph, job["ticker"], job["trade_date"], portfolio,
-                                     on_event=lambda agent: jobs.add_event(self.store, job["id"], agent, "end"))
+                                     on_event=lambda agent, text: jobs.add_event(self.store, job["id"], agent, "end", text))
         report_dir = self.data_dir / "reports" / str(job["id"])
         write_report_tree(final, job["ticker"], report_dir, settings=graph.run_settings())
         plan = final.get("trader_investment_plan")

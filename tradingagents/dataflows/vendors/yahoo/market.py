@@ -279,6 +279,16 @@ def get_currency(symbol: str) -> str | None:
     except Exception:  # unknown symbol or offline: the caller decides
         return None
 
+def search_symbols(query: str, limit: int = 8) -> list[dict]:
+    """Yahoo's symbol search: what a name or partial code resolves to."""
+    try:
+        quotes = yf_retry(lambda: yf.Search(query, max_results=limit, news_count=0).quotes) or []
+    except Exception:  # offline or rate limited: no suggestions
+        return []
+    return [{"symbol": q.get("symbol"), "name": q.get("shortname") or q.get("longname") or "",
+             "exchange": q.get("exchDisp") or q.get("exchange") or "", "type": q.get("quoteType") or ""}
+            for q in quotes if q.get("symbol")]
+
 def get_stock_stats(
     symbol: Annotated[str, "ticker symbol for the company"],
     indicator: Annotated[

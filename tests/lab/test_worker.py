@@ -17,7 +17,7 @@ class FakeGraph:
 
     def run(self, ticker, date, portfolio, on_event):
         FakeGraph.contexts.append(portfolio)
-        on_event("Market Analyst")
+        on_event("Market Analyst", "excerpt")
         plan = "**Action**: Buy\n\n**Position Sizing**: 10% of portfolio"
         return {"trader_investment_plan": plan, "final_trade_decision": f"**Rating**: {self.rating}"}, self.rating
 
@@ -35,7 +35,7 @@ def make(tmp_path, monkeypatch, rating="Buy"):
     monkeypatch.setattr(w, "write_report_tree", lambda final, ticker, path, settings=None: path.mkdir(parents=True))
     s, keys = Store(tmp_path / "l.sqlite"), KeyVault()
     return s, keys, Worker(s, tmp_path, prices=PRICES, keys=keys,
-                           graph_factory=lambda cfg, an: FakeGraph(cfg, an, rating))
+                           graph_factory=lambda cfg, an: FakeGraph(cfg, an, rating), model_up=lambda m, k: True)
 
 
 def test_analysis_done_key_used_then_dropped(tmp_path, monkeypatch):
@@ -77,3 +77,28 @@ def test_replay_chain_passes_portfolio_of_the_moment(tmp_path, monkeypatch):
     assert FakeGraph.contexts[0].positions == []
     assert FakeGraph.contexts[1].position_in("NVDA").quantity == 10      # 10% of 10000 at 100
     assert all(jobs.get(s, i)["status"] == "done" for i in ids)
+
+
+def test_waits_for_model_instead_of_failing(tmp_path, monkeypatch):
+    import tradingagents.lab.worker as wm
+    s, keys, w = make(tmp_path, monkeypatch)
+    up = {"v": False}
+    w.model_up = lambda m, k: up["v"]
+    monkeypatch.setattr(wm, "MODEL_POLL_S", 0)
+    jid = jobs.enqueue(s, "analysis", ticker="NVDA", trade_date="2026-06-01", model={**MODEL, "needs_key": False})
+    assert w.run_once() is False and w.waiting == jid
+    assert jobs.get(s, jid)["status"] == "queued"
+    assert [e["agent"] for e in jobs.events(s, jid)] == ["Modelo"]
+    up["v"] = True
+    assert w.run_once() is True and jobs.get(s, jid)["status"] == "done" and w.waiting is None
+
+
+def test_gives_up_after_max_wait(tmp_path, monkeypatch):
+    import tradingagents.lab.worker as wm
+    s, keys, w = make(tmp_path, monkeypatch)
+    w.model_up = lambda m, k: False
+    monkeypatch.setattr(wm, "MODEL_POLL_S", 0)
+    monkeypatch.setattr(wm, "MODEL_WAIT_MAX_S", -1)
+    jid = jobs.enqueue(s, "analysis", ticker="NVDA", trade_date="2026-06-01", model={**MODEL, "needs_key": False})
+    w.run_once()
+    assert jobs.get(s, jid)["status"] == "failed" and "Cookbook" in jobs.get(s, jid)["error"]
