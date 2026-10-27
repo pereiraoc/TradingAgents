@@ -131,10 +131,11 @@ def insiders(fetch: Fetch, limit: int = 40, pause: float = 0.15) -> list[dict]:
     out, seen = [], set()
     for entry in feed.iter(f"{ATOM}entry"):
         link = entry.find(f"{ATOM}link").get("href", "") if entry.find(f"{ATOM}link") is not None else ""
-        if not link or link in seen:
-            continue
-        seen.add(link)
         folder = link.rsplit("/", 1)[0]
+        accession = folder.rsplit("/", 1)[-1]   # the same filing is listed under the issuer and the owner CIK
+        if not link or accession in seen:
+            continue
+        seen.add(accession)
         try:
             time.sleep(pause)   # SEC fair-access: well under 10 requests per second
             files = json.loads(fetch(folder + "/index.json"))["directory"]["item"]
@@ -149,7 +150,7 @@ def insiders(fetch: Fetch, limit: int = 40, pause: float = 0.15) -> list[dict]:
         value = parsed["bought"] if buy else parsed["sold"]
         who = f"{parsed['owner']}{' (' + parsed['title'] + ')' if parsed['title'] else ''}"
         out.append({
-            "source": "insider", "uid": f"insider:{link}", "ts": (entry.findtext(f"{ATOM}updated") or "")[:19],
+            "source": "insider", "uid": f"insider:{accession}", "ts": (entry.findtext(f"{ATOM}updated") or "")[:19],
             "actor": parsed["owner"], "url": link,
             "title": f"{who} {'comprou' if buy else 'vendeu'} US$ {value:,.0f} de {parsed['ticker']}",
             "body": "Form 4 (SEC)",
