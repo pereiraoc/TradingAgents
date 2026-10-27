@@ -55,16 +55,15 @@ Comando novo: `tradingagents lab serve`.
 
 ### 4.1 Tabelas
 
-- `jobs(id, kind[analysis|replay_step|backtest_cell], status[queued|running|done|failed|review],
+- `jobs(id, kind[analysis|backtest], status[queued|running|done|failed|review],
   ticker, trade_date, analysts, model_json (sem chave), portfolio_id?, parent_id?, error,
   created_at, started_at, finished_at, report_dir, rating)`
 - `job_events(job_id, ts, agent, phase[start|end], note)` — andamento ao vivo.
 - `portfolios(id, name, currency, initial_cash, benchmark, mode[live|replay],
-  replay_start?, replay_end?, replay_every_days?, tickers_json?, allow_short=0,
-  default_weights_json, created_at)`
+  replay_json?, weights_json, created_at)`
 - `trades(id, portfolio_id, job_id, ticker, side, quantity, price, fill_date,
   rating, sizing_source[ai_percent|ai_quantity|ai_amount|default_weight], status[pending|filled], reason)`
-- `cash_moves(id, portfolio_id, date, amount, kind[initial|trade])`
+- Caixa = `initial_cash` − compras + vendas preenchidas (calculado, sem tabela própria).
 - `watchlists(id, name, tickers_json)`
 - `backtests(id, tickers_json, start, end, every_days, analysts, model_json, status, summary_json)`
 
@@ -96,7 +95,12 @@ de sizing do trader, carteira atual, preço de referência.
    Sell 0%), editável por carteira.
 6. Sell com sizing parcial ("trim 50%") → reduz a posição nessa fração.
 7. Quantidade inteira (arredonda para baixo), limitada pelo caixa; sem alavancagem;
-   short só se `allow_short` e a IA pedir explicitamente.
+   **sem venda a descoberto na v1** (a posição nunca fica negativa).
+8. Nota de alta nunca reduz a posição e nota de baixa nunca aumenta: o alvo é limitado
+   pela posição atual. Quantidade/valor do trader são o *tamanho da ordem* (delta),
+   percentual "of portfolio" é peso-alvo, percentual "of the position" em nota de baixa é
+   a fração a vender.
+9. O cálculo acontece **no preenchimento**, com o preço de execução e a carteira daquele dia.
 
 `sizing_source` registra qual regra valeu, para auditoria no extrato.
 
@@ -116,8 +120,10 @@ x índice no período, total de operações, acerto por nota.
 
 ### 4.6 Backtest
 
-Reusa `tradingagents.backtest` (grade ações × datas, sem carteira); cada célula vira um job
-`backtest_cell` na mesma fila; o resumo (`summarize`) é salvo em `summary_json`.
+Reusa `tradingagents.backtest.run_backtest` (grade ações × datas, sem carteira) como **um job
+`backtest`** na mesma fila; o `progress` dele vira eventos do job, e uma varredura interrompida
+retoma ao rodar de novo (o próprio `run_backtest` pula células já feitas). O resumo
+(`summarize(...).render()` + números por nota) é salvo em `summary_json`.
 
 ### 4.7 API HTTP
 
@@ -161,8 +167,9 @@ Mesmo padrão do Finanças e do Uso de IA (arquivos novos + ganchos mínimos, re
   ("PETR4 Buy, VALE3 Hold…"), que o agendador já notifica.
 - **Ligar o Qwen não é feito de dentro da `trading_run`**: a autoridade dela não inclui o
   recurso `serve_model`. A aba **Agenda** cria um par de Tarefas pela API existente — uma
-  `cookbook_serve` (preset + `end_after_min`) alguns minutos antes, e a `trading_run` que
-  espera o modelo subir. Os dois aparecem nas Tarefas do Odysseus.
+  `cookbook_serve` agendada (preset + `end_after_min`) com `then_task_id` apontando para a
+  `trading_run` (sem agenda própria), que espera o modelo subir. As duas aparecem nas Tarefas
+  do Odysseus. Com modelo remoto, só a `trading_run` agendada.
 - Os relatórios são mostrados em `<iframe sandbox srcdoc>` (o Odysseus manda `X-Frame-Options:
   DENY` em toda rota, então não dá para iframar uma URL; `srcdoc` herda o CSP da página, que
   permite estilo inline e bloqueia script — o HTML do relatório é estático).
