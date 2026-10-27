@@ -42,7 +42,7 @@ Módulos pequenos, cada um testável sozinho:
 |---|---|
 | `store.py` | SQLite (`lab.sqlite`), migrações, acesso às tabelas. |
 | `jobs.py` | Fila: enfileirar, pegar o próximo, marcar estado, retomar após reinício. |
-| `worker.py` | Thread única que consome a fila; roda `TradingAgentsGraph.propagate` com checkpoint ligado; grava eventos de andamento. |
+| `worker.py` | Thread única que consome a fila; roda o grafo pelo mesmo caminho de *stream* da CLI (`begin_checkpoint`/`end_checkpoint`, checkpoint ligado), gravando um evento por nó concluído. |
 | `llm.py` | Monta a config do TradingAgents a partir do modelo recebido (provider, base_url, modelo quick/deep, chave só em memória). |
 | `sizing.py` | Converte decisão (nota + `position_sizing` do trader) em quantidade-alvo. |
 | `fills.py` | Preço de execução: fechamento do primeiro pregão após a data da análise (yfinance). |
@@ -77,8 +77,14 @@ container reiniciou e precisa de chave volta como `failed` com o erro
 
 ### 4.3 Regra de tamanho (`sizing.py`)
 
-Entrada: nota (Buy/Overweight/Hold/Underweight/Sell/REVIEW), texto `position_sizing` do
-trader, carteira atual, preço de referência.
+Entrada: nota final do Portfolio Manager (Buy/Overweight/Hold/Underweight/Sell/REVIEW), texto
+de sizing do trader, carteira atual, preço de referência.
+
+- A **direção** vem sempre da nota do Portfolio Manager (é ela que o fork devolve como sinal).
+- O **tamanho** vem do trader: `trader_investment_plan` no estado final é texto renderizado por
+  `render_trader_proposal`; o campo é lido da linha `**Position Sizing**: ...`. Se o trader
+  apontou outra direção que o PM (ex.: trader Buy, PM Underweight), o sizing dele é ignorado
+  e vale o peso padrão da nota do PM.
 
 1. `REVIEW` → nenhuma operação; job vai para `review` para o usuário decidir.
 2. `Hold` → nenhuma operação.
@@ -144,15 +150,22 @@ Mesmo padrão do Finanças e do Uso de IA (arquivos novos + ganchos mínimos, re
   `GET /api/trading/models` lista `model_endpoints` habilitados; ao criar job/run, resolve o
   endpoint escolhido (base_url, modelo, chave decifrada) e anexa ao corpo.
 - `static/js/trading.js`, `static/css/zz-fork-trading.css`: seção `#trading-section` com abas
-  **Analisar**, **Relatórios**, **Carteiras**, **Backtest**, **Agenda**. Relatório exibido em
-  iframe `srcdoc`/sandbox (HTML do fork); andamento por polling de `/jobs/{id}`.
+  **Analisar**, **Relatórios**, **Carteiras**, **Backtest**, **Agenda**; andamento por polling
+  de `/jobs/{id}`.
 - Ação `trading_run` registrada em `BUILTIN_ACTIONS`/`BUILTIN_ACTION_INFO` **a partir do módulo
-  do painel** (sem editar `src/builtin_actions.py`). Parâmetros: `watchlist_id` ou `tickers`,
-  `portfolio_id?`, `endpoint_id`, `model`, `cookbook_preset?`. Fluxo: se o endpoint é local e
-  não responde e há preset → `action_cookbook_serve`; envia `POST /portfolios/{id}/run`
-  (ou jobs avulsos); espera os jobs terminarem; devolve resumo ("PETR4 Buy, VALE3 Hold…"),
-  que o agendador já notifica. Desliga o modelo ao fim se foi ela que ligou.
-- Aba **Agenda** cria/lista Tarefas `trading_run` pela API de tarefas existente.
+  do painel** (sem editar `src/builtin_actions.py`). O agendador já repassa `task.prompt` como
+  `prompt=` a qualquer ação e mapeia a autoridade para `scheduled__trading_run`, então a config
+  vai em JSON no prompt: `{watchlist_id | tickers, portfolio_id?, endpoint_id, model,
+  wait_model_min}`. Fluxo: espera o endpoint responder até `wait_model_min`; envia
+  `POST /portfolios/{id}/run` (ou jobs avulsos); espera os jobs terminarem; devolve resumo
+  ("PETR4 Buy, VALE3 Hold…"), que o agendador já notifica.
+- **Ligar o Qwen não é feito de dentro da `trading_run`**: a autoridade dela não inclui o
+  recurso `serve_model`. A aba **Agenda** cria um par de Tarefas pela API existente — uma
+  `cookbook_serve` (preset + `end_after_min`) alguns minutos antes, e a `trading_run` que
+  espera o modelo subir. Os dois aparecem nas Tarefas do Odysseus.
+- Os relatórios são mostrados em `<iframe sandbox srcdoc>` (o Odysseus manda `X-Frame-Options:
+  DENY` em toda rota, então não dá para iframar uma URL; `srcdoc` herda o CSP da página, que
+  permite estilo inline e bloqueia script — o HTML do relatório é estático).
 - Ganchos: `app.py` (registrar rotas), `static/index.html` (seção, CSS, script),
   `docker/pereiraoc.yml` (serviço `tradingagents-lab` + `TRADING_LAB_URL`).
 - Sem motor respondendo: o painel mostra aviso com o comando de build.
@@ -166,7 +179,8 @@ Mesmo padrão do Finanças e do Uso de IA (arquivos novos + ganchos mínimos, re
 | Container reinicia com job `running` | volta para `queued` (ou `failed` se dependia de chave, §4.2). |
 | Preço do pregão seguinte indisponível | operação `pending`, preenchida depois. |
 | Moeda diferente da carteira | recusado ao enfileirar. |
-| Qwen não sobe na tarefa agendada | tarefa falha e notifica; nada é enfileirado. |
+| Qwen não sobe na tarefa agendada | `trading_run` desiste após `wait_model_min`, falha e notifica; nada é enfileirado. |
+| Chat do Odysseus usando o Qwen ao mesmo tempo | permitido; as duas coisas ficam mais lentas (o servidor atende em sequência). |
 
 ## 7. Testes
 
