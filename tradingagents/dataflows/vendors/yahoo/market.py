@@ -272,6 +272,13 @@ def get_closes(symbol: str, start_date: str, end_date: str) -> pd.Series:
     return history["Close"] if history is not None and "Close" in history else pd.Series(dtype=float)
 
 
+def get_currency(symbol: str) -> str | None:
+    """The quote currency Yahoo reports for ``symbol``, or None when it cannot say."""
+    try:
+        return yf_retry(lambda: yf.Ticker(normalize_symbol(symbol)).fast_info["currency"])
+    except Exception:  # unknown symbol or offline: the caller decides
+        return None
+
 def get_stock_stats(
     symbol: Annotated[str, "ticker symbol for the company"],
     indicator: Annotated[

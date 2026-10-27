@@ -16,19 +16,17 @@ def _shift(day: str, days: int) -> str:
 
 
 class YahooPrices:
-    def closes(self, ticker: str, start: str, end: str) -> list[tuple[str, float]]:
-        import yfinance as yf
+    """Daily closes and quote currency through the data layer (vendor calls live there)."""
 
-        df = yf.Ticker(ticker).history(start=start, end=end, auto_adjust=False)
-        return [(idx.strftime("%Y-%m-%d"), float(v)) for idx, v in df["Close"].items()]
+    def closes(self, ticker: str, start: str, end: str) -> list[tuple[str, float]]:
+        from tradingagents.dataflows.vendors.yahoo.market import get_closes
+
+        return [(idx.strftime("%Y-%m-%d"), float(v)) for idx, v in get_closes(ticker, start, end).items()]
 
     def currency(self, ticker: str) -> str | None:
-        import yfinance as yf
+        from tradingagents.dataflows.vendors.yahoo.market import get_currency
 
-        try:
-            return yf.Ticker(ticker).fast_info["currency"]
-        except Exception:  # unknown ticker or offline: the caller decides
-            return None
+        return get_currency(ticker)
 
 
 def next_close(prices: PriceSource, ticker: str, day: str) -> tuple[str, float] | None:

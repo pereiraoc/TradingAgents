@@ -194,5 +194,30 @@ def logout(plan: Annotated[Plan, typer.Argument(help="The plan to sign out of")]
         console.print("Not signed in to ChatGPT.")
 
 
+lab_app = typer.Typer(help="Trading Lab: paper portfolios, a run queue and an HTTP API.")
+app.add_typer(lab_app, name="lab")
+
+
+@lab_app.command("serve")
+def lab_serve(host: str = "127.0.0.1", port: int = 7100):
+    """Serve the lab API and run its worker (one analysis at a time)."""
+    import os
+    from pathlib import Path
+
+    import uvicorn
+
+    from tradingagents.lab.api import create_app
+    from tradingagents.lab.fills import YahooPrices
+    from tradingagents.lab.llm import KeyVault
+    from tradingagents.lab.store import Store
+    from tradingagents.lab.worker import Worker
+
+    data_dir = Path(os.getenv("TRADINGAGENTS_LAB_DIR") or Path.home() / ".tradingagents")
+    store, keys, prices = Store(data_dir / "lab.sqlite"), KeyVault(), YahooPrices()
+    worker = Worker(store, data_dir, prices=prices, keys=keys)
+    worker.start()
+    uvicorn.run(create_app(store, worker, keys, prices), host=host, port=port)
+
+
 if __name__ == "__main__":
     app()
